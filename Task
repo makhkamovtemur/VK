@@ -1,0 +1,89 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"github.com/segmentio/kafka-go"
+	"sync"
+	"time"
+)
+
+type Document struct {
+	URL            string
+	PubDate        uint64
+	FetchTime      uint64
+	Text           string
+	FirstFetchTime uint64
+}
+
+type DocumentProcessor struct {
+	mu      sync.Mutex
+	storage map[string]*Document
+}
+
+func NewDocumentProcessor() *DocumentProcessor {
+	return &DocumentProcessor{
+		storage: make(map[string]*Document),
+	}
+}
+
+func (dp *DocumentProcessor) Process(d *Document) (*Document, error) {
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	if existing, ok := dp.storage[d.URL]; ok {
+		if d.FetchTime < existing.FirstFetchTime {
+			existing.FirstFetchTime = d.FetchTime
+			existing.PubDate = d.PubDate
+		}
+		if d.FetchTime > existing.FetchTime {
+			existing.FetchTime = d.FetchTime
+			existing.Text = d.Text
+		}
+	} else {
+		dp.storage[d.URL] = &Document{
+			URL:            d.URL,
+			PubDate:        d.PubDate,
+			FetchTime:      d.FetchTime,
+			Text:           d.Text,
+			FirstFetchTime: d.FetchTime,
+		}
+	}
+
+	return dp.storage[d.URL], nil
+}
+
+func main() {
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:   []string{"localhost:9092"},
+		Topic:     "incoming-documents",
+		Partition: 0,
+	})
+	w := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:  []string{"localhost:9092"},
+		Topic:    "processed-documents",
+		Balancer: &kafka.LeastBytes{},
+	})
+
+	processor := NewDocumentProcessor()
+
+	for {
+		m, err := r.ReadMessage(context.Background())
+		if err != nil {
+			break // handle error
+		}
+
+		var doc Document
+		if err := json.Unmarshal(m.Value, &doc); err != nil {
+			continue // handle error
+		}
+
+		processedDoc, _ := processor.Process(&doc)
+		if processedDoc != nil {
+			docBytes, _ := json.Marshal(processedDoc)
+			w.WriteMessages(context.Background(), kafka.Message{
+				Value: docBytes,
+			})
+		}
+	}
+}
